@@ -69,7 +69,7 @@ erDiagram
         string title
         int year
         int tmdb_id
-        string poster_url
+        string poster_path "TMDB image path, e.g. /abc123.jpg"
         list genres "e.g. [Drama, Sci-Fi]"
         float tmdb_popularity "niche-ness signal"
         int fan_count "number of users who favorited it"
@@ -176,12 +176,13 @@ limits, so the only constraint is how long the crawl takes. At ~1 request/sec,
 flowchart LR
     LB[(Letterboxd<br/>public profiles)]
     TMDB[(TMDB API<br/>free key)]
+    IMG[(TMDB image CDN<br/>no key needed)]
 
     subgraph Ingest ["Ingest (Python, run locally)"]
         S[Scraper<br/>httpx + selectolax<br/>~1 req/sec]
         Q[(SQLite<br/>crawl queue)]
         E[Enricher<br/>posters, genres,<br/>popularity]
-        P[Post-processor<br/>builds CO_FAVORITED,<br/>fan_count, lift]
+        P[Post-processor<br/>builds CO_FAVORITED,<br/>fan_count, search index]
     end
 
     subgraph Local ["My laptop (docker compose)"]
@@ -199,7 +200,8 @@ flowchart LR
     E -->|SET film properties| DB
     P -->|batch Cypher| DB
     DB -->|Cypher results| API
-    API -->|JSON: recs + subgraph| FE
+    API -->|JSON: film search, recs, subgraph| FE
+    IMG -->|poster images by poster_path| FE
     FE <--> U
 ```
 
@@ -208,7 +210,7 @@ flowchart LR
 | :--- | :--- | :--- | :--- |
 | Scraper | Python, `httpx`, `selectolax`/BeautifulSoup | Letterboxd's API is invite-only, so profile HTML is the only source | Free |
 | User discovery | Snowball crawl: popular members page → their followers/following | Builds a connected graph instead of random isolated users | Free |
-| Enrichment | TMDB API (Letterboxd film pages include the TMDB id) | Posters, genres, directors, popularity | Free with API key |
+| Enrichment | TMDB API (Letterboxd film pages include the TMDB id) | Posters, genres, popularity | Free with API key |
 | Graph DB | **Neo4j Community** (Cypher) in Docker, with the free Graph Data Science (GDS) plugin | Native graph traversal, good tooling (Neo4j Browser), the most widely used graph DB. Local means no size caps or idle pauses | Free |
 | Backend | **FastAPI** + official `neo4j` Python driver | Same language as the scraper, generates API docs automatically | Free (runs locally) |
 | Frontend | **React + Vite** with **Sigma.js + graphology** | Sigma renders large graphs with WebGL. graphology includes ForceAtlas2 layout and Louvain | Free (Vite dev server) |
@@ -222,6 +224,27 @@ multi-hop queries are clumsy, and the graph is the point of the project);
 Memgraph (Cypher-compatible, but a smaller ecosystem); Cytoscape.js or
 react-force-graph for visualization (simpler, but slow beyond a few thousand
 nodes).
+
+### Film search & selection
+When choosing seed films, users search **our own Film nodes in Neo4j**, not
+TMDB directly.
+- **Why not search TMDB?** TMDB has ~1M movies and our graph has ~20k. A film
+  that no scraped user favorited has no edges, so selecting it would return
+  zero recommendations. Searching Neo4j guarantees every selectable film is
+  connected to the graph.
+- **It's still TMDB data.** The enricher copies each film's `tmdb_id`, title,
+  year, genres, and `poster_path` from TMDB into its Film node, so search
+  results show the same titles and posters TMDB would.
+- **How:** the post-processor creates a Neo4j full-text index on
+  `Film.title`. The frontend calls `GET /films/search?q=stalk` as the user
+  types, and FastAPI returns the top matches (title, year, poster), ranked by
+  text match and `fan_count`.
+- **Posters** load in the browser straight from TMDB's image CDN
+  (`https://image.tmdb.org/t/p/w342/{poster_path}`), which needs no API key.
+  The TMDB API key is only used by the enricher and never reaches the browser.
+- **Films not in the graph:** if a search returns no matches, the UI says
+  "We don't have data on that movie yet" and nothing can be selected. Only
+  films that exist in the graph can be chosen as seeds.
 
 ### Recommendation algorithm (v1 → v3)
 1. **Taste-overlap co-occurrence (v1).** For seed films *S*, find every user
@@ -277,7 +300,7 @@ defending a public service.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│  FOURFOLD          [ Import from Letterboxd: ________ ]  [Go]         │
+│  FOUR DEGREES          [ Import from Letterboxd: ________ ]  [Go]         │
 ├───────────────────────────────────────────────────────────────────────┤
 │  Your four:  [Stalker ×] [In the Mood for Love ×] [+ add] [+ add]     │
 │  Niche dial:  popular ●━━━━━━━○━━━ obscure                            │
